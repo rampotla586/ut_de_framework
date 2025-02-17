@@ -1,0 +1,628 @@
+--DATA_INGESTION_SCRIPT
+
+from snowflake.snowpark import Session
+from snowflake.snowpark.functions import col
+from datetime import datetime, timedelta
+import pytz
+import time
+import traceback
+from croniter import croniter
+import os
+
+def get_snowflake_session():
+    """
+    Get a Snowflake session dynamically. 
+    Uses Snowflake Notebook session if running inside Snowflake.
+    Uses environment variables if running externally (e.g., CircleCI).
+    """
+    if "CIRCLECI" in os.environ:  # Running inside CircleCI
+        print("🔹 Running in CircleCI - Using environment variables")
+        connection_parameters = {
+            "account": os.getenv("SNOWFLAKE_ACCOUNT"),
+            "user": os.getenv("SNOWFLAKE_USER"),
+            "password": os.getenv("SNOWFLAKE_PASSWORD"),
+            "role": os.getenv("SNOWFLAKE_ROLE"),
+            "warehouse": os.getenv("SNOWFLAKE_WAREHOUSE"),
+            "database": os.getenv("SNOWFLAKE_DATABASE"),
+            "schema": os.getenv("SNOWFLAKE_SCHEMA")
+        }
+    else:  # Running inside Snowflake Notebook
+        print("🔹 Running in Snowflake Notebook - Using built-in session")
+        session = Session.builder.getOrCreate()
+        return session  
+
+    # Validate that all required environment variables are set
+    missing_keys = [key for key, value in connection_parameters.items() if not value]
+    if missing_keys:
+        raise ValueError(f"❌ Missing environment variables: {', '.join(missing_keys)}")
+
+    # Create Snowflake session using environment variables
+    session = Session.builder.configs(connection_parameters).create()
+    return session
+
+# Initialize the Snowflake session dynamically
+session = get_snowflake_session()
+
+# Validate session connection
+print("✅ Connected to Snowflake")
+print(f"🔹 Account: {session.get_current_account()}")
+print(f"🔹 User: {session.get_current_user()}")
+print(f"🔹 Role: {session.get_current_role()}")
+print(f"🔹 Warehouse: {session.get_current_warehouse()}")
+print(f"🔹 Database: {session.get_current_database()}")
+print(f"🔹 Schema: {session.get_current_schema()}")
+
+########################################
+# Utility Functions
+########################################
+
+def check_table_exists(session, table_name):
+    """Check if a table exists by attempting to select one row."""
+    try:
+        session.sql(f"SELECT 1 FROM {table_name} LIMIT 1").collect()
+        return True
+    except Exception as e:
+        print(f"[ERROR] Table '{table_name}' does not exist: {e}")
+        return False
+
+def generate_log_id(session):
+    """Generate a new log id using a stored procedure."""
+    try:
+        return session.call("generate_log_id")
+    except Exception as e:
+        print(f"[ERROR] Generating log ID failed: {e}")
+        return None
+
+########################################
+# Table Creation & Alteration Functions
+########################################
+
+def create_table(session, table_name, data_ingestion_id):
+    """Dynamically create a table based on column mappings."""
+    try:
+        table_di_mapping = "UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_MAPPING"
+        mapping_df = session.table(table_di_mapping)
+        filtered_mapping_df = mapping_df.filter(col("DATA_INGESTION_ID") == data_ingestion_id)\
+                                        .order_by("DESTINATION_COLUMN_ORDER").collect()
+
+        if not filtered_mapping_df:
+            print(f"[ERROR] No mapping found in DATA_INGESTION_MAPPING for ID: {data_ingestion_id}")
+            return False
+
+        columns = [
+            f"{mapping['DESTINATION_COLUMN_NAME']} {mapping['DESTINATION_COLUMN_DATATYPE']}"
+            for mapping in filtered_mapping_df
+        ]
+        create_table_sql = f"CREATE OR REPLACE TABLE {table_name} ({', '.join(columns)})"
+        session.sql(create_table_sql).collect()
+        print(f"[SUCCESS] Table '{table_name}' created successfully.")
+        return True
+    except Exception as e:
+        print(f"[ERROR] Table creation failed: {e}")
+        return False
+
+def ensure_scd_columns_exist(session, table_name):
+    """Ensure that the target table has the necessary SCD Type 2 columns."""
+    scd_columns = [
+        "CURRENT_FLAG BOOLEAN DEFAULT TRUE",
+        "START_DATE TIMESTAMP_NTZ(9)",
+        "END_DATE TIMESTAMP_NTZ(9)"
+    ]
+    for column in scd_columns:
+        column_name = column.split()[0]
+        try:
+            session.sql(f"ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS {column}").collect()
+            print(f"[INFO] Column '{column_name}' added to '{table_name}'.")
+        except Exception as e:
+            if "ambiguous column name" in str(e):
+                print(f"[INFO] Column '{column_name}' already exists in '{table_name}'.")
+            else:
+                print(f"[ERROR] Adding column '{column_name}' failed: {e}")
+
+########################################
+# Logging Function
+########################################
+
+def log_data_ingestion(session, data_ingestion_id, source_path, destination_table,
+                       stage_name, file_format_name, load_type, source_count,
+                       destination_count, status, error_message=None):
+    """Log details about the data ingestion process."""
+    try:
+        processed_error_message = (
+            f"'{error_message.replace(chr(39), chr(39) + chr(39))}'"
+            if error_message else "NULL"
+        )
+
+        log_sql = f"""
+            INSERT INTO UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_LOG (
+                DATA_INGESTION_LOG_ID, DATA_INGESTION_ID, SOURCE, DESTINATION, STAGE, FILE_FORMAT,
+                LOAD_TYPE, LOAD_START_TIME, LOAD_END_TIME, SOURCE_COUNT, DESTINATION_COUNT, LOAD_STATUS, ERROR_MESSAGE
+            ) VALUES (
+                {generate_log_id(session)}, {data_ingestion_id}, '{source_path.replace("'", "''")}', 
+                '{destination_table.replace("'", "''")}', '{stage_name.replace("'", "''")}', '{file_format_name.replace("'", "''")}', 
+                '{load_type}', CURRENT_TIMESTAMP(), CURRENT_TIMESTAMP(), 
+                {source_count}, {destination_count}, '{status}', {processed_error_message}
+            )
+        """
+        session.sql(log_sql).collect()
+        print(f"[INFO] Log updated successfully for Data Ingestion ID {data_ingestion_id}")
+    except Exception as e:
+        print(f"[ERROR] Updating log failed: {e}")
+
+########################################
+# Scheduling Functions
+########################################
+
+def calculate_next_run(session, data_ingestion_id):
+    """Calculate the next run time for a schedule based on schedule type."""
+    try:
+        schedule_query = f"""
+            SELECT s.*, h.CRON_EXPRESSION
+            FROM UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_SCHEDULE s
+            JOIN UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_HEADER h
+              ON s.DATA_INGESTION_ID = h.DATA_INGESTION_ID
+            WHERE s.DATA_INGESTION_ID = {data_ingestion_id};
+        """
+        schedule = session.sql(schedule_query).collect()[0]
+        schedule_type = schedule["SCHEDULE_TYPE"]
+        last_run = schedule["LAST_RUN"]
+        schedule_interval = schedule["SCHEDULE_INTERVAL"]  # In minutes for RECURRING
+        timezone = pytz.timezone(schedule["SCHEDULE_TIMEZONE"]) if schedule["SCHEDULE_TIMEZONE"] else pytz.UTC
+
+        # Localize LAST_RUN if needed
+        last_run_tz = (
+            timezone.localize(last_run) if last_run and last_run.tzinfo is None
+            else last_run or datetime.now(timezone)
+        )
+        next_run = None
+
+        if schedule_type == "RECURRING":
+            if not schedule_interval:
+                print(f"[ERROR] RECURRING schedule missing interval for ID {data_ingestion_id}")
+                return None
+            next_run = last_run_tz + timedelta(minutes=schedule_interval)
+        elif schedule_type == "CRON":
+            cron_expression = schedule["CRON_EXPRESSION"]
+            if not cron_expression:
+                print(f"[ERROR] CRON expression missing for ID {data_ingestion_id}")
+                return None
+            cron = croniter(cron_expression, last_run_tz)
+            next_run = cron.get_next(datetime)
+
+        if next_run:
+            print(f"[DEBUG] Calculated NEXT_RUN for {data_ingestion_id}: {next_run}")
+            return next_run
+        else:
+            print(f"[ERROR] Could not calculate NEXT_RUN for ID {data_ingestion_id}")
+            return None
+
+    except Exception as e:
+        print(f"[ERROR] Error calculating NEXT_RUN: {e}")
+        return None
+
+def update_next_run(session, schedule_id, schedule_interval, tz):
+    """Atomically update LAST_RUN and NEXT_RUN for a schedule."""
+    try:
+        current_time = datetime.now(tz)
+        next_run = current_time + timedelta(minutes=schedule_interval)
+        formatted_current_time = current_time.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        formatted_next_run = next_run.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        print(f"[DEBUG] Updating schedule ID {schedule_id} with LAST_RUN: {formatted_current_time} and NEXT_RUN: {formatted_next_run}")
+        update_sql = f"""
+            UPDATE UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_SCHEDULE
+            SET LAST_RUN = '{formatted_current_time}',
+                NEXT_RUN = '{formatted_next_run}',
+                UPDATED_AT = CURRENT_TIMESTAMP()
+            WHERE DATA_INGESTION_SCHEDULE_ID = {schedule_id};
+        """
+        session.sql(update_sql).collect()
+        print(f"[SUCCESS] Schedule updated for Schedule ID {schedule_id}.")
+    except Exception as e:
+        print(f"[ERROR] Failed to update schedule for Schedule ID {schedule_id}: {e}")
+
+########################################
+# Data Load Functions
+########################################
+
+def full_load(session, data_ingestion_id):
+    """Execute a full load with SCD Type 2 logic (including deduplication and MERGE)."""
+    try:
+        # Retrieve ingestion header details
+        data_ingestion_header = session.table("UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_HEADER")\
+                                       .filter(col("DATA_INGESTION_ID") == data_ingestion_id).collect()[0]
+        stage_name = data_ingestion_header["STAGE_NAME"]
+        source_path = data_ingestion_header["SOURCE_PATH"]
+        destination_path = data_ingestion_header["DESTINATION_PATH"]
+        file_format_name = data_ingestion_header["FILE_FORMAT_NAME"]
+        # Replace with actual unique key columns from header (now extracted properly)
+        unique_key_columns = [key.strip().upper() for key in data_ingestion_header["UNIQUE_KEY_COLUMNS"].split(",")]
+
+        print(f"Executing FULL load with SCD Type 2 for table: {destination_path}")
+
+        # Ensure target table has necessary SCD columns
+        ensure_scd_columns_exist(session, destination_path)
+
+        # Check and create staging table if needed
+        staging_table_name = f"{destination_path}_STAGING"
+        if not check_table_exists(session, staging_table_name):
+            if not create_table(session, staging_table_name, data_ingestion_id):
+                return
+
+        # List files in the stage for debugging
+        print("[DEBUG] Listing files in the stage:")
+        staged_files = session.sql(f"LIST @{stage_name}/{source_path}").collect()
+        for file in staged_files:
+            print(file["name"])
+
+        copy_into_sql = f"""
+            COPY INTO {staging_table_name}
+            FROM '@{stage_name}/{source_path}'
+            FILE_FORMAT = (FORMAT_NAME = '{file_format_name}')
+            ON_ERROR = 'CONTINUE'
+            FORCE = TRUE;
+        """
+        try:
+            copy_results = session.sql(copy_into_sql).collect()
+            source_count = sum(res["ROWS_LOADED"] for res in copy_results if "ROWS_LOADED" in res)
+            print(f"Source Count (rows loaded into staging): {source_count}")
+        except Exception as e:
+            print(f"[ERROR] COPY INTO failed: {e}")
+            log_data_ingestion(
+                session, data_ingestion_id, source_path, destination_path,
+                stage_name, file_format_name, 'FULL', 0, 0, 'FAILED', str(e)
+            )
+            return
+
+        # Deduplicate rows in staging table
+        dedup_sql = f"""
+            CREATE OR REPLACE TABLE {staging_table_name}_DEDUP AS
+            SELECT * FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY {', '.join(unique_key_columns)} 
+                                               ORDER BY {unique_key_columns[0]} DESC NULLS LAST) AS row_num
+                FROM {staging_table_name}
+            )
+            WHERE row_num = 1;
+        """
+        try:
+            session.sql(dedup_sql).collect()
+            print(f"[DEBUG] Deduplication complete into '{staging_table_name}_DEDUP'.")
+        except Exception as e:
+            print(f"[ERROR] Deduplication failed: {e}")
+            return
+
+        # Prepare MERGE logic for SCD Type 2 processing
+        destination_columns = [field.name.upper() for field in session.table(destination_path).schema.fields]
+        non_key_columns = [
+            col_name for col_name in destination_columns
+            if col_name not in unique_key_columns + ["CURRENT_FLAG", "START_DATE", "END_DATE"]
+        ]
+        update_clause = ", ".join([f"target.{col} = staging.{col}" for col in non_key_columns])
+        insert_columns = ", ".join(unique_key_columns + non_key_columns + ["START_DATE", "CURRENT_FLAG"])
+        insert_values = ", ".join([f"staging.{col}" for col in unique_key_columns + non_key_columns] + ["CURRENT_TIMESTAMP()", "TRUE"])
+        on_conditions = ' AND '.join([f"target.{col} = staging.{col}" for col in unique_key_columns])
+        non_key_update_conditions = ' OR '.join([f"target.{col} IS DISTINCT FROM staging.{col}" for col in non_key_columns])
+
+        merge_sql = f"""
+            MERGE INTO {destination_path} AS target
+            USING {staging_table_name}_DEDUP AS staging
+            ON {on_conditions}
+            WHEN MATCHED AND ({non_key_update_conditions})
+            THEN
+                UPDATE SET 
+                    {update_clause},
+                    target.END_DATE = CURRENT_TIMESTAMP(),
+                    target.CURRENT_FLAG = FALSE
+            WHEN NOT MATCHED THEN
+                INSERT ({insert_columns})
+                VALUES ({insert_values});
+        """
+        print(f"[DEBUG] Merge Query: {merge_sql}")
+        session.sql(merge_sql).collect()
+        print(f"Data merged successfully into '{destination_path}'.")
+
+        # Log the full load process
+        destination_count_after = session.table(destination_path).count()
+        log_data_ingestion(
+            session, data_ingestion_id, source_path, destination_path,
+            stage_name, file_format_name, 'FULL', source_count, destination_count_after, 'SUCCESS'
+        )
+        print(f"Full load completed successfully. Total records: {destination_count_after}")
+
+        # Update schedule (if exists)
+        schedule_rows = session.sql(
+            f"SELECT DATA_INGESTION_SCHEDULE_ID, SCHEDULE_INTERVAL, SCHEDULE_TIMEZONE FROM UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_SCHEDULE WHERE DATA_INGESTION_ID = {data_ingestion_id}"
+        ).collect()
+        if schedule_rows:
+            schedule_id = schedule_rows[0]["DATA_INGESTION_SCHEDULE_ID"]
+            schedule_interval = schedule_rows[0]["SCHEDULE_INTERVAL"]
+            tz = pytz.timezone(schedule_rows[0]["SCHEDULE_TIMEZONE"]) if schedule_rows[0]["SCHEDULE_TIMEZONE"] else pytz.UTC
+            update_next_run(session, schedule_id, schedule_interval, tz)
+        else:
+            print(f"[ERROR] No schedule found for Data Ingestion ID {data_ingestion_id} while updating schedule.")
+
+    except Exception as e:
+        print(f"[ERROR] Error during FULL load for ingestion ID {data_ingestion_id}: {e}")
+
+def incremental_load(session, data_ingestion_id):
+    """Execute an incremental load with SCD Type 2 logic."""
+    try:
+        data_ingestion_header = session.table("UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_HEADER")\
+                                       .filter(col("DATA_INGESTION_ID") == data_ingestion_id).collect()[0]
+        stage_name = data_ingestion_header["STAGE_NAME"]
+        source_path = data_ingestion_header["SOURCE_PATH"]
+        destination_path = data_ingestion_header["DESTINATION_PATH"]
+        file_format_name = data_ingestion_header["FILE_FORMAT_NAME"]
+        unique_key_columns = [key.strip().upper() for key in data_ingestion_header["UNIQUE_KEY_COLUMNS"].split(",")]
+
+        print(f"Executing INCREMENTAL load with SCD Type 2 for table: {destination_path}")
+
+        ensure_scd_columns_exist(session, destination_path)
+
+        staging_table_name = f"{destination_path}_STAGING"
+        if not check_table_exists(session, staging_table_name):
+            if not create_table(session, staging_table_name, data_ingestion_id):
+                return
+
+        copy_into_sql = f"""
+            COPY INTO {staging_table_name}
+            FROM '@{stage_name}/{source_path}'
+            FILE_FORMAT = (FORMAT_NAME = '{file_format_name}')
+            ON_ERROR = 'CONTINUE'
+            FORCE = TRUE;
+        """
+        copy_results = session.sql(copy_into_sql).collect()
+        source_count = sum(res["ROWS_LOADED"] for res in copy_results if "ROWS_LOADED" in res)
+        print(f"Source Count (rows loaded into staging): {source_count}")
+
+        if source_count == 0:
+            print(f"No rows were loaded into staging table: {staging_table_name}. Exiting.")
+            log_data_ingestion(
+                session, data_ingestion_id, source_path, destination_path,
+                stage_name, file_format_name, 'INCREMENTAL', source_count, 0, 'FAILED',
+                error_message="No rows loaded into staging table."
+            )
+            return
+
+        dedup_sql = f"""
+            CREATE OR REPLACE TABLE {staging_table_name}_DEDUP AS
+            SELECT * FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY {', '.join(unique_key_columns)}
+                                               ORDER BY CURRENT_TIMESTAMP()) AS row_num
+                FROM {staging_table_name}
+            )
+            WHERE row_num = 1;
+        """
+        session.sql(dedup_sql).collect()
+        print(f"Deduplication complete in staging table '{staging_table_name}_DEDUP'.")
+
+        destination_columns = [field.name.upper() for field in session.table(destination_path).schema.fields]
+        non_key_columns = [
+            col_name for col_name in destination_columns
+            if col_name not in unique_key_columns + ["CURRENT_FLAG", "START_DATE", "END_DATE"]
+        ]
+        update_clause = ", ".join([f"target.{col} = staging.{col}" for col in non_key_columns])
+        insert_columns = ", ".join(unique_key_columns + non_key_columns + ["START_DATE", "CURRENT_FLAG"])
+        insert_values = ", ".join([f"staging.{col}" for col in unique_key_columns + non_key_columns] + ["CURRENT_TIMESTAMP()", "TRUE"])
+        on_conditions = ' AND '.join([f"target.{col} = staging.{col}" for col in unique_key_columns])
+        non_key_update_conditions = ' OR '.join([f"target.{col} IS DISTINCT FROM staging.{col}" for col in non_key_columns])
+
+        merge_sql = f"""
+            MERGE INTO {destination_path} AS target
+            USING {staging_table_name}_DEDUP AS staging
+            ON {on_conditions}
+            WHEN MATCHED AND target.CURRENT_FLAG = TRUE AND ({non_key_update_conditions})
+            THEN
+                UPDATE SET 
+                    {update_clause},
+                    target.END_DATE = CURRENT_TIMESTAMP(),
+                    target.CURRENT_FLAG = FALSE
+            WHEN NOT MATCHED THEN
+                INSERT ({insert_columns})
+                VALUES ({insert_values});
+        """
+        print(f"[DEBUG] Merge Query: {merge_sql}")
+        session.sql(merge_sql).collect()
+        print(f"Data merged successfully into '{destination_path}'.")
+
+        destination_count_after = session.table(destination_path).count()
+        log_data_ingestion(
+            session, data_ingestion_id, source_path, destination_path,
+            stage_name, file_format_name, 'INCREMENTAL', source_count, destination_count_after, 'SUCCESS'
+        )
+        print(f"Incremental load completed successfully. Total records: {destination_count_after}")
+
+    except Exception as e:
+        print(f"[ERROR] Error during incremental load for ingestion ID {data_ingestion_id}: {e}")
+
+def bulk_load(session, data_ingestion_id):
+    """Execute a bulk load using MERGE with deduplication."""
+    try:
+        data_ingestion_header = session.table("UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_HEADER")\
+                                       .filter(col("DATA_INGESTION_ID") == data_ingestion_id).collect()[0]
+        stage_name = data_ingestion_header["STAGE_NAME"]
+        source_path = data_ingestion_header["SOURCE_PATH"]
+        destination_path = data_ingestion_header["DESTINATION_PATH"]
+        file_format_name = data_ingestion_header["FILE_FORMAT_NAME"]
+        unique_key_columns = data_ingestion_header["UNIQUE_KEY_COLUMNS"]
+
+        print(f"Executing BULK load for table: {destination_path}")
+
+        staging_table_name = f"{destination_path}_STAGING"
+        if not check_table_exists(session, staging_table_name):
+            if not create_table(session, staging_table_name, data_ingestion_id):
+                return
+
+        copy_into_sql = f"""
+            COPY INTO {staging_table_name}
+            FROM '@{stage_name}/{source_path}'
+            FILE_FORMAT = (FORMAT_NAME = '{file_format_name}')
+            ON_ERROR = 'CONTINUE'
+            FORCE = TRUE;
+        """
+        copy_results = session.sql(copy_into_sql).collect()
+        source_count = sum(res["ROWS_LOADED"] for res in copy_results if "ROWS_LOADED" in res)
+        print(f"Source Count (rows loaded into staging): {source_count}")
+
+        if source_count == 0:
+            print(f"No rows were loaded into staging table: {staging_table_name}. Exiting.")
+            log_data_ingestion(
+                session, data_ingestion_id, source_path, destination_path,
+                stage_name, file_format_name, 'BULK', source_count, 0, 'FAILED',
+                error_message="No rows loaded into staging table."
+            )
+            return
+
+        unique_key_list = [key.strip() for key in unique_key_columns.split(',')]
+        dedup_sql = f"""
+            CREATE OR REPLACE TABLE {staging_table_name}_DEDUP AS
+            SELECT * FROM (
+                SELECT *, ROW_NUMBER() OVER (PARTITION BY {', '.join(unique_key_list)} 
+                                               ORDER BY {unique_key_list[0]} ASC) AS row_num
+                FROM {staging_table_name}
+            )
+            QUALIFY row_num = 1;
+        """
+        session.sql(dedup_sql).collect()
+        print(f"Deduplication complete in staging table '{staging_table_name}_DEDUP'.")
+
+        destination_count_before = session.table(destination_path).count()
+        print(f"Destination Count Before Merge: {destination_count_before}")
+        on_conditions = ' AND '.join([f"target.{col} = staging.{col}" for col in unique_key_list])
+        destination_columns = [
+            mapping['DESTINATION_COLUMN_NAME']
+            for mapping in session.table("UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_MAPPING")
+                                  .filter(col("DATA_INGESTION_ID") == data_ingestion_id).collect()
+        ]
+        merge_sql = f"""
+            MERGE INTO {destination_path} AS target
+            USING {staging_table_name}_DEDUP AS staging
+            ON {on_conditions}
+            WHEN MATCHED AND target.CURRENT_FLAG = TRUE THEN
+                UPDATE SET target.CURRENT_FLAG = FALSE, target.END_DATE = CURRENT_TIMESTAMP()
+            WHEN NOT MATCHED THEN
+                INSERT ({', '.join(destination_columns)}, START_DATE, CURRENT_FLAG)
+                VALUES ({', '.join([f'staging.{col}' for col in destination_columns])}, CURRENT_TIMESTAMP(), TRUE);
+        """
+        session.sql(merge_sql).collect()
+        print(f"Data merged successfully into '{destination_path}'.")
+
+        destination_count_after = session.table(destination_path).count()
+        print(f"Destination Count After Merge: {destination_count_after}")
+
+        log_data_ingestion(
+            session, data_ingestion_id, source_path, destination_path,
+            stage_name, file_format_name, 'BULK', source_count, destination_count_after, 'SUCCESS'
+        )
+    except Exception as e:
+        print(f"[ERROR] Error during BULK load for ingestion ID {data_ingestion_id}: {e}")
+        log_data_ingestion(
+            session, data_ingestion_id, source_path, destination_path,
+            stage_name, file_format_name, 'BULK', 0, 0, 'FAILED', str(e)
+        )
+
+def append_load(session, data_ingestion_id):
+    """Execute an append load into the destination table."""
+    try:
+        header = get_data_ingestion_header(session, data_ingestion_id)
+        mappings = get_data_ingestion_mappings(session, data_ingestion_id)
+        source_count = get_source_count(session, header["STAGE_NAME"], header["SOURCE_PATH"], header["FILE_FORMAT_NAME"])
+
+        stage_name = header["STAGE_NAME"]
+        source_path = header["SOURCE_PATH"]
+        destination_table = header["DESTINATION_PATH"]
+        file_format = header["FILE_FORMAT_NAME"]
+
+        print(f"Executing Append Load for Destination Table: {destination_table}")
+
+        destination_columns = [m["DESTINATION_COLUMN_NAME"] for m in mappings]
+        # FIXED: Removed extra curly braces so that the result is like "$1 AS COL_NAME"
+        source_columns_mapping = [f"${i+1} AS {m['DESTINATION_COLUMN_NAME']}" for i, m in enumerate(mappings)]
+
+        append_sql = f"""
+            INSERT INTO {destination_table} ({', '.join(destination_columns)}, START_DATE, END_DATE, CURRENT_FLAG)
+            SELECT {', '.join(destination_columns)},
+                   CURRENT_TIMESTAMP() AS START_DATE,
+                   NULL AS END_DATE,
+                   TRUE AS CURRENT_FLAG
+            FROM (
+                SELECT {', '.join(source_columns_mapping)}
+                FROM '@{stage_name}/{source_path}'
+                (FILE_FORMAT => '{file_format}')
+            ) AS source_data;
+        """
+        session.sql(append_sql).collect()
+        destination_count = session.table(destination_table).count()
+
+        log_data_ingestion(
+            session, data_ingestion_id, source_path, destination_table,
+            stage_name, file_format, "APPEND", source_count, destination_count, "SUCCESS"
+        )
+        print(f"Append load completed successfully for {destination_table}. Source Count: {source_count}, Destination Count: {destination_count}")
+
+    except Exception as e:
+        log_data_ingestion(
+            session, data_ingestion_id, header["SOURCE_PATH"], header["DESTINATION_PATH"],
+            header["STAGE_NAME"], header["FILE_FORMAT_NAME"], "APPEND", 0, 0, "FAILED", str(e)
+        )
+        print(f"[ERROR] Error during Append Load for {destination_table}: {str(e)}")
+
+########################################
+# Placeholder Helper Functions
+########################################
+
+def get_data_ingestion_header(session, data_ingestion_id):
+    """Retrieve the data ingestion header. (Implement as needed)"""
+    return session.table("UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_HEADER")\
+                  .filter(col("DATA_INGESTION_ID") == data_ingestion_id).collect()[0]
+
+def get_data_ingestion_mappings(session, data_ingestion_id):
+    """Retrieve the data ingestion mappings. (Implement as needed)"""
+    return session.table("UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_MAPPING")\
+                  .filter(col("DATA_INGESTION_ID") == data_ingestion_id).collect()
+
+def get_source_count(session, stage_name, source_path, file_format):
+    """Return the count of source rows from the stage. (Implement as needed)"""
+    # Replace this dummy logic with your actual implementation
+    return 100
+
+########################################
+# Main Execution - Dynamic Ingestion Loop
+########################################
+
+if __name__ == "__main__":
+    try:
+        session = Session.builder.getOrCreate()
+        # Set context: Adjust the database, schema, and role as required
+        session.sql("USE DATABASE UT_DE_FRAMEWORK").collect()
+        session.sql("USE SCHEMA CONFIG").collect()
+        session.sql("USE ROLE SYSADMIN").collect()
+        print("[DEBUG] Session context set to UT_DE_FRAMEWORK.CONFIG and role SYSADMIN.")
+
+        # Retrieve only active data ingestion definitions.
+        # Filter on IS_ACTIVE (adjust the column name if needed)
+        ingestion_headers = session.table("UT_DE_FRAMEWORK.CONFIG.DATA_INGESTION_HEADER")\
+                                   .filter(col("IS_ACTIVE") == True)\
+                                   .collect()
+
+        for header in ingestion_headers:
+            data_ingestion_id = header["DATA_INGESTION_ID"]
+            # Use bracket notation with a fallback default for load type.
+            load_type = (header["LOAD_TYPE"] if header["LOAD_TYPE"] is not None else "FULL").upper()
+
+            print(f"\n[INFO] Processing DATA_INGESTION_ID {data_ingestion_id} with load type {load_type}")
+
+            if load_type == "FULL":
+                full_load(session, data_ingestion_id)
+            elif load_type == "INCREMENTAL":
+                incremental_load(session, data_ingestion_id)
+            elif load_type == "BULK":
+                bulk_load(session, data_ingestion_id)
+            elif load_type == "APPEND":
+                append_load(session, data_ingestion_id)
+            else:
+                print(f"[WARN] Unknown LOAD_TYPE '{load_type}' for DATA_INGESTION_ID {data_ingestion_id}. Skipping.")
+
+    except Exception as e:
+        print(f"[ERROR] An error occurred during session initialization or execution: {e}")
+
+
