@@ -1,0 +1,6 @@
+--SCHEDULE INGEST
+
+create or replace task UT_DE_FRAMEWORK.CONFIG.SCHEDULE_INGEST
+	warehouse=NOTEBOOK_WH
+	schedule='USING CRON */10 * * * * Asia/Calcutta'
+	as EXECUTE NOTEBOOK "UT_DE_FRAMEWORK"."CONFIG"."DEMO"();
