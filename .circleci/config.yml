@@ -1,0 +1,316 @@
+version: 2.1
+parameters:
+  github_trigger:
+    type: boolean
+    default: false
+
+workflows:
+  test:
+    jobs:
+      - build_lint_test
+  github_action:
+    when: << pipeline.parameters.github_trigger >>
+    jobs: 
+      - add_label_on_open_pr
+  daily_release:
+    triggers:
+      - schedule:
+          cron: "00 07 * * 3" # Mon-Thursday at 2pm CT (19 -> 7pm UTC)
+          filters:
+            branches:
+              only:
+                - develop
+    jobs:
+      - generate_release_pr
+  build_test_deploy:
+    unless: << pipeline.parameters.github_trigger >>
+    jobs:
+    - update_labels_after_merge:
+        filters:
+          branches:
+            only: [develop,main]
+    - detect_and_run_sql_changes:
+        filters:
+          branches:
+            only: [develop, main]
+jobs:
+  add_label_on_open_pr:
+    docker:
+      - image: cimg/python:3.8.15
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - rb-dependencies-v3-{{ checksum "local_requirements.txt" }}-{{ epoch }}
+      - run:
+          command: |-
+            python3 -m venv venv
+            . venv/bin/activate
+            pip3 install --upgrade pip
+            pip install requests
+            pip install -r local_requirements.txt
+          name: Install Requirements
+      - save_cache:
+          paths:
+            - venv
+          key: rb-dependencies-v3-{{ checksum "local_requirements.txt" }}-{{ epoch }}
+      - run:
+          command: |-
+            echo "This CircleCI job was triggered by a Github Action."
+          name: Run Github Job
+      - run:
+          command: |-
+            python3 -m venv venv
+            . venv/bin/activate
+            if [ $CIRCLE_PULL_REQUEST ]; then
+              export TARGET_BRANCH=`python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r $CIRCLE_PROJECT_REPONAME -l ${CIRCLE_PULL_REQUEST##*/} -c get_target_branch -e "{}"`
+              echo "TARGET BRANCH = $TARGET_BRANCH"
+            fi
+            # If this is an open PR and target is develop, label "In Progress"
+            if [[ ${CIRCLE_PULL_REQUEST##*/} && $TARGET_BRANCH = "develop" ]]; then
+              python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r $CIRCLE_PROJECT_REPONAME -l ${CIRCLE_PULL_REQUEST##*/} -c add_labels -e "{\"labels\": [\"In Progress\"]}"
+            # If this is an open PR and target is release, label "Todays Releases"
+            elif [[ ${CIRCLE_PULL_REQUEST##*/} && $TARGET_BRANCH = "main" ]]; then
+              python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r $CIRCLE_PROJECT_REPONAME -l ${CIRCLE_PULL_REQUEST##*/} -c add_labels -e "{\"labels\": [\"Todays Releases\"]}"
+            fi
+          name: Add Labels (Open PRs)
+  
+  generate_release_pr:
+    docker:
+      - image: cimg/python:3.8.15
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - rb-dependencies-v3-{{ checksum "local_requirements.txt" }}-{{ epoch }}
+      - run:
+          command: |-
+            python3 -m venv venv
+            . venv/bin/activate
+            pip3 install --upgrade pip
+            pip install requests
+            pip install -r local_requirements.txt
+          name: Install Requirements
+      - save_cache:
+          paths:
+            - venv
+          key: rb-dependencies-v3-{{ checksum "local_requirements.txt" }}-{{ epoch }}
+      - run:
+          command: |-
+            . venv/bin/activate
+            PR_LIST=($(python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r $CIRCLE_PROJECT_REPONAME -c get_prs_to_deploy -e "{}"| tr -d '[],'))
+            if [ ${#PR_LIST[@]} -eq 0 ]; then
+                echo "Couldn't find a Github Issue for Today's Releases."
+                exit 0
+            fi
+            RED='\033[0;31m'
+            UNDERLINE='\033[4m'
+            NOT_UNDERLINE='\033[24m'
+            NC='\033[0m'
+            DEPLOY_NAME=$1
+            BRANCH_NAME="deploy/$(date '+%Y-%m-%d')"
+            PR_TITLE="Deploy: $(date '+%Y-%m-%d')"
+            git config --global user.name rampotla586
+            git config --global user.email sivap@unitedtechno.com
+            git clone https://rampotla586:$GITHUB_TOKEN@github.com/rampotla586/ut_de_framework.git --branch=develop tmpdir
+            cd tmpdir
+            git checkout main
+            git pull
+            git checkout -b $BRANCH_NAME
+            for PR_NUMBER in ${PR_LIST[@]}; do
+              git checkout develop
+              eval PR_NUMBER=$PR_NUMBER
+              COMMIT=$(git log --grep=" (#${PR_NUMBER})$" --pretty="format:%H" | rev | cut -c 1- | rev)
+              echo $COMMIT
+              git checkout $BRANCH_NAME
+              git cherry-pick --strategy=recursive -X theirs $COMMIT
+              cherry_pick_result=$?
+              if [ "$cherry_pick_result" != "0" ]; then
+                printf "${RED}Unable to apply ${UNDERLINE}PR #${PR_NUMBER}${NOT_UNDERLINE} to the release branch.${NC}\n"
+                exit 1
+              fi
+            done || exit
+            git commit --allow-empty -m "Merging PRs into deploy branch"
+            git push -u origin $BRANCH_NAME -f
+            cd ..
+            ISSUE_NUMBER=($(python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r $CIRCLE_PROJECT_REPONAME -c get_deploy_issue_number -e "{}"))
+            python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r $CIRCLE_PROJECT_REPONAME -c open_pr -e "{\"base\": \"main\", \"head\": \"$BRANCH_NAME\",\"title\": \"$PR_TITLE\", \"body\": \"Resolves #${ISSUE_NUMBER}\"}"
+            python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r $CIRCLE_PROJECT_REPONAME -c close_issue -e "{\"issue\": \"$ISSUE_NUMBER\"}"
+          name: Parse Today's Issue for PRs to Deploy & Create New PR
+
+  build_lint_test:
+    docker:
+      - image: cimg/python:3.8.15
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - rb-dependencies-v3-{{ checksum "local_requirements.txt" }}-{{ epoch }}
+      - run:
+          command: |-
+            python3 -m venv venv
+            . venv/bin/activate
+            pip3 install --upgrade pip
+            pip install requests
+            pip install -r local_requirements.txt
+          name: Install Requirements
+      - save_cache:
+          paths:
+            - venv
+          key: rb-dependencies-v3-{{ checksum "local_requirements.txt" }}-{{ epoch }}
+      - run:
+          command: |-
+            # Set the database names dynamically based on the branch
+            if [ "$CIRCLE_BRANCH" == "main" ]; then
+              export ENV=""
+            else
+              export ENV="_DEVELOP"
+            fi
+            echo "Using databases: $ENV"
+            
+            # Step 1: Find changed files between last commit and current commit
+            CHANGED_FILES=$(git diff --name-only $CIRCLE_SHA1~1 $CIRCLE_SHA1)
+            # Debugging: Check the changed files detected
+            echo "Changed files: $CHANGED_FILES"
+
+            # Step 2: Install Snowflake CLI (snowsql)
+            echo "Installing Snowflake CLI (snowsql)..."
+            python3 -m venv venv
+            . venv/bin/activate
+            pip3 install --upgrade pip
+            pip install snowflake-cli-labs
+            
+            # Step 3: Iterate over changed SQL files
+            for FILE in $CHANGED_FILES; do
+              # Check if the file exists (to handle deleted files)
+              if [ -f "$FILE" ]; then
+                # Check if the file ends with .sql
+                if [[ "$FILE" == *.sql ]]; then
+                  echo "Running SQL script: $FILE"
+
+                  # Determine the appropriate folder based on the branch
+                  if [ "$CIRCLE_BRANCH" == "main" ]; then
+                    FOLDER="main"
+                  else
+                    FOLDER="develop"
+                  fi
+
+                  # Step 5: Replace the placeholders with the actual database names
+                  sed -i "s/{{ENV}}/$ENV/g" "$FILE"
+
+                  # Run EXPLAIN on the SQL file to check for syntax issues
+                  snow sql -q "EXPLAIN PLAN FOR $(cat $FILE)" --temporary-connection --account $SNOWFLAKE_ACCOUNT --user $SNOWFLAKE_USER --password $SNOWFLAKE_PASSWORD --role $SNOWFLAKE_ROLE --warehouse $SNOWFLAKE_WAREHOUSE --database $SNOWFLAKE_DATABASE --schema $SNOWFLAKE_SCHEMA
+                else
+                  echo "Skipping non-SQL file: $FILE"
+                fi
+              else
+                echo "File $FILE was deleted, skipping..."
+              fi
+            done
+          name: Test sql files
+
+  detect_and_run_sql_changes:
+    docker:
+      - image: cimg/python:3.8.15
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - rb-dependencies-v3-{{ checksum "local_requirements.txt" }}-{{ epoch }}
+      - run:
+          command: |-
+            python3 -m venv venv
+            . venv/bin/activate
+            pip3 install --upgrade pip
+            pip install requests
+            pip install -r local_requirements.txt
+          name: Install Requirements
+      - save_cache:
+          paths:
+            - venv
+          key: rb-dependencies-v3-{{ checksum "local_requirements.txt" }}-{{ epoch }}
+      - run:
+          command: |-
+            # Set the database names dynamically based on the branch
+            if [ "$CIRCLE_BRANCH" == "main" ]; then
+              export ENV=""
+            else
+              export ENV="_DEVELOP"
+            fi
+            echo "Using databases: $ENV"
+            
+            # Step 1: Find changed files between last commit and current commit
+            CHANGED_FILES=$(git diff --name-only $CIRCLE_SHA1~1 $CIRCLE_SHA1)
+            # Debugging: Check the changed files detected
+            echo "Changed files: $CHANGED_FILES"
+
+            # Step 2: Install Snowflake CLI (snowsql)
+            echo "Installing Snowflake CLI (snowsql)..."
+            python3 -m venv venv
+            . venv/bin/activate
+            pip3 install --upgrade pip
+            pip install snowflake-cli-labs
+            
+            # Step 3: Iterate over changed SQL files
+            for FILE in $CHANGED_FILES; do
+              # Check if the file exists (to handle deleted files)
+              if [ -f "$FILE" ]; then
+                # Check if the file ends with .sql
+                if [[ "$FILE" == *.sql ]]; then
+                  echo "Running SQL script: $FILE"
+
+                  # Determine the appropriate folder based on the branch
+                  if [ "$CIRCLE_BRANCH" == "main" ]; then
+                    FOLDER="main"
+                  else
+                    FOLDER="develop"
+                  fi
+
+                  # Step 5: Replace the placeholders with the actual database names
+                  sed -i "s/{{ENV}}/$ENV/g" "$FILE"
+
+                  # Step 6: Run the SQL script on Snowflake with the dynamically replaced database name
+                  snow sql -q "ALTER GIT REPOSITORY UT_DE_FRAMEWORK.CONFIG.UT_DE_FRAMEWORK_REPO FETCH" --temporary-connection --account $SNOWFLAKE_ACCOUNT --user $SNOWFLAKE_USER --password $SNOWFLAKE_PASSWORD --role $SNOWFLAKE_ROLE --warehouse $SNOWFLAKE_WAREHOUSE --database $SNOWFLAKE_DATABASE --schema $SNOWFLAKE_SCHEMA
+                  snow sql -q "EXECUTE IMMEDIATE FROM @UT_DE_FRAMEWORK.CONFIG.UT_DE_FRAMEWORK_REPO/branches/$FOLDER/$FILE USING (ENV => '$ENV')" --temporary-connection --account $SNOWFLAKE_ACCOUNT --user $SNOWFLAKE_USER --password $SNOWFLAKE_PASSWORD --role $SNOWFLAKE_ROLE --warehouse $SNOWFLAKE_WAREHOUSE --database $SNOWFLAKE_DATABASE --schema $SNOWFLAKE_SCHEMA
+                else
+                  echo "Skipping non-SQL file: $FILE"
+                fi
+              else
+                echo "File $FILE was deleted, skipping..."
+              fi
+            done
+          name: Detect and Run Modified SQL Scripts in Snowflake
+
+  update_labels_after_merge:
+    docker:
+      - image: cimg/python:3.8.15
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - rb-dependencies-v3-{{ checksum "local_requirements.txt" }}-{{ epoch }}
+      - run:
+          command: |-
+            python3 -m venv venv
+            . venv/bin/activate
+            pip3 install --upgrade pip
+            pip install requests
+            pip install -r local_requirements.txt
+          name: Install Requirements
+      - save_cache:
+          paths:
+            - venv
+          key: rb-dependencies-v3-{{ checksum "local_requirements.txt" }}-{{ epoch }}
+      - run:
+          command: |-
+            . venv/bin/activate
+            # Deploying to Dev clusters, Update labels for this PR
+            if [ $CIRCLE_BRANCH = "develop" ]; then
+              python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r ${CIRCLE_PROJECT_REPONAME} -c label_merged_pr -e "{\"labels_to_add\": [\"In Testing\"], \"labels_to_delete\": [\"In Progress\"], \"commit_id\": \"$CIRCLE_SHA1\"}"
+            # Deploying to Prod clusters, Update labels for this PR and referenced PRs
+            elif [ $CIRCLE_BRANCH = "main" ]; then
+              python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r ${CIRCLE_PROJECT_REPONAME} -c label_merged_pr -e "{\"labels_to_add\": [\"Deployed\"], \"labels_to_delete\": [\"Todays Releases\"], \"commit_id\": \"$CIRCLE_SHA1\"}"
+              python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r ${CIRCLE_PROJECT_REPONAME} -c label_prs_mentioned_in_commits -e "{\"labels_to_add\": [\"Released\"], \"labels_to_delete\": [\"In Testing\"], \"commit_id\": \"$CIRCLE_SHA1\"}"
+            fi
+          name: Update Labels (Merged PRs)
+       

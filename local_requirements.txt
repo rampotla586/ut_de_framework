@@ -1,0 +1,29 @@
+# requirements only needed by CICD Process and our local environment
+# Not needed by (and may conflict with) astro's own pypi dependencies
+argparse==1.4.0
+attrs==22.2.0
+black==22.6.0
+coverage==6.2
+flake8==4.0.1
+inflection~=0.5.1
+jinja2==3.1.2
+markupsafe>=2.0.1
+mock==4.0.3
+pendulum==2.1.2
+pipdeptree==2.2.0
+psycopg2-binary==2.9.3
+pytest==6.2.5
+retrying==1.3.3
+safety >= 1.0, < 2
+sqlfluff==0.8.2
+typing-extensions>=4.3.0
+vulture==2.3
+werkzeug>=2.0
+wtforms==2.3.3
+wtforms-components==0.10.5
+markdown==3.3.6
+typer==0.6.1
+pyopenssl==24.1.0
+requests==2.28.0
+pydot==1.4.2
+testfixtures==6.18.5
