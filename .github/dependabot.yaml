@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    # Check for PyPi package updates on Sundays at 9:30am ET/14:30 UTC
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "14:30"
+    # Disable opening PRs for PyPi updates
+    open-pull-requests-limit: 0
+    labels:
+      - "pypi_vulnerability"
+      - "dependencies"
+
+  - package-ecosystem: "github-actions"
+    directory: "/.github/workflows"
+    # Check for github action updates on Sundays at 9:30am ET/14:30 UTC
+    schedule:
+      interval: "weekly"
+      day: "sunday"
+      time: "14:30"
+    # Open up to 10 PRs for Github Action updates
+    open-pull-requests-limit: 10
+    labels:
+      - "github_action_vulnerability"
+      - "dependencies"
