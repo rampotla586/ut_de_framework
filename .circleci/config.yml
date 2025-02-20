@@ -69,7 +69,7 @@ jobs:
             # If this is an open PR and target is develop, label "In Progress"
             if [[ ${CIRCLE_PULL_REQUEST##*/} && $TARGET_BRANCH = "develop" ]]; then
               python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r $CIRCLE_PROJECT_REPONAME -l ${CIRCLE_PULL_REQUEST##*/} -c add_labels -e "{\"labels\": [\"In Progress\"]}"
-            # If this is an open PR and target is release, label "Todays Releases"
+            # If this is an open PR and target is main, label "Todays Releases"
             elif [[ ${CIRCLE_PULL_REQUEST##*/} && $TARGET_BRANCH = "main" ]]; then
               python3 .circleci/github_api_calls.py -o rampotla586 -t $GITHUB_TOKEN -r $CIRCLE_PROJECT_REPONAME -l ${CIRCLE_PULL_REQUEST##*/} -c add_labels -e "{\"labels\": [\"Todays Releases\"]}"
             fi
@@ -126,7 +126,7 @@ jobs:
               git cherry-pick --strategy=recursive -X theirs $COMMIT
               cherry_pick_result=$?
               if [ "$cherry_pick_result" != "0" ]; then
-                printf "${RED}Unable to apply ${UNDERLINE}PR #${PR_NUMBER}${NOT_UNDERLINE} to the release branch.${NC}\n"
+                printf "${RED}Unable to apply ${UNDERLINE}PR #${PR_NUMBER}${NOT_UNDERLINE} to the main branch.${NC}\n"
                 exit 1
               fi
             done || exit
