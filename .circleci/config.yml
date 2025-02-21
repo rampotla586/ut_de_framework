@@ -15,7 +15,7 @@ workflows:
   daily_release:
     triggers:
       - schedule:
-          cron: "30 * * * 1-5" # Mon-Thursday at 2pm CT (19 -> 7pm UTC)
+          cron: "0 3 * * *" # Daily Once at 3 AM UTC
           filters:
             branches:
               only:
