@@ -12,10 +12,10 @@ workflows:
     when: << pipeline.parameters.github_trigger >>
     jobs: 
       - add_label_on_open_pr
-  daily_release:
+  monthly_release:  # ✅ Correctly defined as a separate workflow
     triggers:
       - schedule:
-          cron: "0 3 * * *" # Daily Once at 3 AM UTC
+          cron: "0 3 1 * *"  # Runs on the 1st of every month at 3 AM UTC
           filters:
             branches:
               only:
